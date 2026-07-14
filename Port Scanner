@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""
+Port Scanner Tool
+-----------------
+A multi-threaded TCP port scanner with optional banner grabbing.
+
+Usage examples:
+    python port_scanner.py -t example.com -p 1-1024
+    python port_scanner.py -t 192.168.1.1 -p 22,80,443,8080
+    python port_scanner.py -t example.com -p 1-65535 --threads 200 --banner
+    python port_scanner.py -t example.com -p 1-1024 --output results.json
+
+NOTE: Only scan hosts you own or have explicit permission to test.
+Unauthorized port scanning may violate laws/policies in your jurisdiction.
+"""
+
+import argparse
+import concurrent.futures
+import ipaddress
+import json
+import socket
+import sys
+import time
+from datetime import datetime
+
+# A small map of well-known ports -> service names, used when banner grabbing
+# doesn't return anything useful.
+COMMON_PORTS = {
+    20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP",
+    53: "DNS", 67: "DHCP", 68: "DHCP", 69: "TFTP", 80: "HTTP",
+    110: "POP3", 111: "RPCBIND", 119: "NNTP", 123: "NTP", 135: "MSRPC",
+    137: "NETBIOS-NS", 138: "NETBIOS-DGM", 139: "NETBIOS-SSN", 143: "IMAP",
+    161: "SNMP", 194: "IRC", 389: "LDAP", 443: "HTTPS", 445: "SMB",
+    465: "SMTPS", 514: "SYSLOG", 587: "SMTP-SUB", 631: "IPP",
+    993: "IMAPS", 995: "POP3S", 1080: "SOCKS", 1433: "MSSQL",
+    1521: "ORACLE", 3306: "MYSQL", 3389: "RDP", 5432: "POSTGRESQL",
+    5900: "VNC", 6379: "REDIS", 8080: "HTTP-ALT", 8443: "HTTPS-ALT",
+    27017: "MONGODB",
+}
+
+
+def parse_ports(port_arg: str):
+    """Parse a port argument like '80', '1-1024', or '22,80,443' into a sorted list of ints."""
+    ports = set()
+    for chunk in port_arg.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            start, end = chunk.split("-", 1)
+            start, end = int(start), int(end)
+            if start < 1 or end > 65535 or start > end:
+                raise ValueError(f"Invalid port range: {chunk}")
+            ports.update(range(start, end + 1))
+        else:
+            p = int(chunk)
+            if p < 1 or p > 65535:
+                raise ValueError(f"Invalid port: {p}")
+            ports.add(p)
+    return sorted(ports)
+
+
+def resolve_target(target: str) -> str:
+    """Resolve a hostname to an IP address (or validate an IP)."""
+    try:
+        ipaddress.ip_address(target)
+        return target
+    except ValueError:
+        try:
+            return socket.gethostbyname(target)
+        except socket.gaierror:
+            print(f"[!] Could not resolve host: {target}")
+            sys.exit(1)
+
+
+def grab_banner(sock: socket.socket) -> str:
+    """Try to read a short banner from an open socket."""
+    try:
+        sock.settimeout(1.0)
+        banner = sock.recv(1024)
+        return banner.decode(errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def scan_port(ip: str, port: int, timeout: float, do_banner: bool):
+    """Attempt to connect to a single port. Returns a result dict or None if closed."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            result = sock.connect_ex((ip, port))
+            if result == 0:
+                service = COMMON_PORTS.get(port, "unknown")
+                banner = ""
+                if do_banner:
+                    banner = grab_banner(sock)
+                return {"port": port, "service": service, "banner": banner}
+    except socket.error:
+        return None
+    return None
+
+
+def run_scan(ip: str, ports, timeout: float, max_threads: int, do_banner: bool):
+    open_ports = []
+    total = len(ports)
+    completed = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
+        futures = {
+            executor.submit(scan_port, ip, port, timeout, do_banner): port
+            for port in ports
+        }
+        for future in concurrent.futures.as_completed(futures):
+            completed += 1
+            print(f"\r[*] Scanned {completed}/{total} ports...", end="", flush=True)
+            res = future.result()
+            if res:
+                open_ports.append(res)
+
+    print()  # newline after progress indicator
+    return sorted(open_ports, key=lambda r: r["port"])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Multi-threaded TCP port scanner with optional banner grabbing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Only scan systems you own or are authorized to test.",
+    )
+    parser.add_argument("-t", "--target", required=True, help="Target hostname or IP address")
+    parser.add_argument("-p", "--ports", default="1-1024",
+                         help="Ports to scan, e.g. '80', '1-1024', or '22,80,443' (default: 1-1024)")
+    parser.add_argument("--threads", type=int, default=100, help="Number of concurrent threads (default: 100)")
+    parser.add_argument("--timeout", type=float, default=1.0, help="Socket timeout in seconds (default: 1.0)")
+    parser.add_argument("--banner", action="store_true", help="Attempt to grab service banners on open ports")
+    parser.add_argument("-o", "--output", help="Optional path to save results as JSON")
+
+    args = parser.parse_args()
+
+    try:
+        ports = parse_ports(args.ports)
+    except ValueError as e:
+        print(f"[!] {e}")
+        sys.exit(1)
+
+    ip = resolve_target(args.target)
+
+    print(f"[*] Target       : {args.target} ({ip})")
+    print(f"[*] Ports        : {len(ports)} port(s) [{args.ports}]")
+    print(f"[*] Threads      : {args.threads}")
+    print(f"[*] Banner grab  : {'on' if args.banner else 'off'}")
+    print(f"[*] Started at   : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("-" * 50)
+
+    start = time.time()
+    open_ports = run_scan(ip, ports, args.timeout, args.threads, args.banner)
+    elapsed = time.time() - start
+
+    print("-" * 50)
+    if open_ports:
+        print(f"[+] Found {len(open_ports)} open port(s):\n")
+        print(f"{'PORT':<8}{'SERVICE':<15}{'BANNER'}")
+        for r in open_ports:
+            banner_display = r["banner"][:60] if r["banner"] else "-"
+            print(f"{r['port']:<8}{r['service']:<15}{banner_display}")
+    else:
+        print("[-] No open ports found in the given range.")
+
+    print(f"\n[*] Scan completed in {elapsed:.2f} seconds")
+
+    if args.output:
+        report = {
+            "target": args.target,
+            "resolved_ip": ip,
+            "scanned_ports": args.ports,
+            "open_ports": open_ports,
+            "elapsed_seconds": round(elapsed, 2),
+            "timestamp": datetime.now().isoformat(),
+        }
+        with open(args.output, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"[*] Results saved to {args.output}")
+
+
+if __name__ == "__main__":
+    main()
