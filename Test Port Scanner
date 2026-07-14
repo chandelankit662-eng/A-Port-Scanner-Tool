@@ -1,1 +1,191 @@
+"""
+Unit tests for port_scanner.py
 
+Run with:
+    pytest tests/
+or:
+    python -m unittest discover tests
+"""
+
+import socket
+import sys
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+# Make sure the project root (containing port_scanner.py) is importable
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import port_scanner  # noqa: E402
+
+
+class TestParsePorts(unittest.TestCase):
+    def test_single_port(self):
+        self.assertEqual(port_scanner.parse_ports("80"), [80])
+
+    def test_comma_list(self):
+        self.assertEqual(port_scanner.parse_ports("22,80,443"), [22, 80, 443])
+
+    def test_range(self):
+        self.assertEqual(port_scanner.parse_ports("1-5"), [1, 2, 3, 4, 5])
+
+    def test_mixed_range_and_list(self):
+        self.assertEqual(
+            port_scanner.parse_ports("1-3,80,443"), [1, 2, 3, 80, 443]
+        )
+
+    def test_duplicates_are_deduped_and_sorted(self):
+        self.assertEqual(port_scanner.parse_ports("80,22,80,1-3"), [1, 2, 3, 22, 80])
+
+    def test_whitespace_is_tolerated(self):
+        self.assertEqual(port_scanner.parse_ports(" 22 , 80 "), [22, 80])
+
+    def test_invalid_range_start_greater_than_end(self):
+        with self.assertRaises(ValueError):
+            port_scanner.parse_ports("100-10")
+
+    def test_invalid_port_out_of_bounds_low(self):
+        with self.assertRaises(ValueError):
+            port_scanner.parse_ports("0")
+
+    def test_invalid_port_out_of_bounds_high(self):
+        with self.assertRaises(ValueError):
+            port_scanner.parse_ports("70000")
+
+    def test_invalid_range_out_of_bounds(self):
+        with self.assertRaises(ValueError):
+            port_scanner.parse_ports("1-70000")
+
+    def test_non_numeric_raises(self):
+        with self.assertRaises(ValueError):
+            port_scanner.parse_ports("abc")
+
+
+class TestResolveTarget(unittest.TestCase):
+    def test_valid_ip_returned_as_is(self):
+        self.assertEqual(port_scanner.resolve_target("127.0.0.1"), "127.0.0.1")
+
+    def test_hostname_is_resolved(self):
+        with patch("socket.gethostbyname", return_value="93.184.216.34") as mock_resolve:
+            result = port_scanner.resolve_target("example.com")
+            mock_resolve.assert_called_once_with("example.com")
+            self.assertEqual(result, "93.184.216.34")
+
+    def test_unresolvable_hostname_exits(self):
+        with patch("socket.gethostbyname", side_effect=socket.gaierror):
+            with self.assertRaises(SystemExit):
+                port_scanner.resolve_target("no-such-host.invalid")
+
+
+class TestGrabBanner(unittest.TestCase):
+    def test_returns_decoded_banner(self):
+        fake_sock = MagicMock()
+        fake_sock.recv.return_value = b"SSH-2.0-OpenSSH_8.9\r\n"
+        result = port_scanner.grab_banner(fake_sock)
+        self.assertEqual(result, "SSH-2.0-OpenSSH_8.9")
+
+    def test_returns_empty_string_on_timeout(self):
+        fake_sock = MagicMock()
+        fake_sock.recv.side_effect = socket.timeout
+        result = port_scanner.grab_banner(fake_sock)
+        self.assertEqual(result, "")
+
+    def test_returns_empty_string_on_generic_error(self):
+        fake_sock = MagicMock()
+        fake_sock.recv.side_effect = OSError("boom")
+        result = port_scanner.grab_banner(fake_sock)
+        self.assertEqual(result, "")
+
+
+class TestScanPortLive(unittest.TestCase):
+    """Integration-style tests using a real local TCP server on an ephemeral port."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cls.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        cls.server.bind(("127.0.0.1", 0))
+        cls.server.listen(5)
+        cls.port = cls.server.getsockname()[1]
+        cls.stop_event = threading.Event()
+
+        def accept_loop():
+            cls.server.settimeout(0.5)
+            while not cls.stop_event.is_set():
+                try:
+                    conn, _ = cls.server.accept()
+                    conn.close()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+        cls.thread = threading.Thread(target=accept_loop, daemon=True)
+        cls.thread.start()
+        time.sleep(0.1)  # give the server a moment to start listening
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stop_event.set()
+        cls.server.close()
+        cls.thread.join(timeout=2)
+
+    def test_open_port_is_detected(self):
+        result = port_scanner.scan_port("127.0.0.1", self.port, timeout=1.0, do_banner=False)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["port"], self.port)
+
+    def test_closed_port_returns_none(self):
+        # Find a port that's very unlikely to be open.
+        closed_port = 65530
+        result = port_scanner.scan_port("127.0.0.1", closed_port, timeout=0.5, do_banner=False)
+        self.assertIsNone(result)
+
+    def test_known_service_name_is_attached(self):
+        result = port_scanner.scan_port("127.0.0.1", 22, timeout=0.2, do_banner=False)
+        # Port 22 likely closed in CI, but if open, service name should map to SSH.
+        if result is not None:
+            self.assertEqual(result["service"], "SSH")
+
+
+class TestRunScan(unittest.TestCase):
+    def test_run_scan_finds_open_port_among_range(self):
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(5)
+        open_port = server.getsockname()[1]
+        stop_event = threading.Event()
+
+        def accept_loop():
+            server.settimeout(0.5)
+            while not stop_event.is_set():
+                try:
+                    conn, _ = server.accept()
+                    conn.close()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+        t = threading.Thread(target=accept_loop, daemon=True)
+        t.start()
+        time.sleep(0.1)
+
+        try:
+            # Scan a small range that includes the open port plus some closed ones.
+            ports_to_scan = sorted({open_port, open_port + 1, open_port + 2})
+            results = port_scanner.run_scan("127.0.0.1", ports_to_scan, timeout=0.5,
+                                             max_threads=10, do_banner=False)
+            found_ports = [r["port"] for r in results]
+            self.assertIn(open_port, found_ports)
+        finally:
+            stop_event.set()
+            server.close()
+            t.join(timeout=2)
+
+
+if __name__ == "__main__":
+    unittest.main()
