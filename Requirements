@@ -1,0 +1,6 @@
+# port_scanner.py itself uses only the Python standard library
+# (socket, argparse, concurrent.futures, ipaddress, json) — no runtime
+# dependencies are required to run the tool.
+
+# The following are only needed for running the test suite / CI:
+pytest>=7.0
